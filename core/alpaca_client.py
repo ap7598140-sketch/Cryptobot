@@ -182,22 +182,27 @@ class AlpacaClient:
             )
             bars = self.data.get_crypto_bars(req)
             result: dict[str, list[dict]] = {}
-            # alpaca-py BarSet is a Pydantic model; its .data attribute is
-            # Dict[str, List[Bar]] — that is the only reliable access path.
-            raw: dict = bars.data if hasattr(bars, "data") else {}
+            bars_df = bars.df
             for sym in symbols:
-                sym_bars = raw.get(sym, [])
-                result[sym] = [
-                    {
-                        "t": b.timestamp.isoformat(),
-                        "o": float(b.open),
-                        "h": float(b.high),
-                        "l": float(b.low),
-                        "c": float(b.close),
-                        "v": float(b.volume),
-                    }
-                    for b in sym_bars
-                ]
+                try:
+                    if sym in bars_df.index.get_level_values(0):
+                        sym_df = bars_df.loc[sym].reset_index()
+                        result[sym] = [
+                            {
+                                "t": str(row.get("timestamp", row.name if hasattr(row, "name") else "")),
+                                "o": float(row.get("open", 0)),
+                                "h": float(row.get("high", 0)),
+                                "l": float(row.get("low", 0)),
+                                "c": float(row.get("close", 0)),
+                                "v": float(row.get("volume", 0)),
+                            }
+                            for _, row in sym_df.iterrows()
+                        ]
+                    else:
+                        result[sym] = []
+                except Exception as ex:
+                    logger.warning("No bars for %s: %s", sym, ex)
+                    result[sym] = []
             return result
         except Exception as e:
             logger.error("get_bars error: %s", e)
