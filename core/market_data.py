@@ -174,17 +174,13 @@ async def _get(session: aiohttp.ClientSession, url: str, params: dict = None,
     return None
 
 
-# ── Binance funding rate ───────────────────────────────────────────────────────
+# ── Funding rate ──────────────────────────────────────────────────────────────
+# Binance futures API returns HTTP 451 (geo-blocked in the US).
+# Return a neutral 0.0 so downstream logic continues unaffected.
 
 async def get_funding_rate(coin: str) -> Optional[float]:
-    """Returns latest funding rate as a decimal (e.g. 0.0001)."""
-    symbol = to_binance_symbol(coin)
-    url = "https://fapi.binance.com/fapi/v1/fundingRate"
-    async with aiohttp.ClientSession() as session:
-        data = await _get(session, url, params={"symbol": symbol, "limit": 1})
-    if data and isinstance(data, list) and data:
-        return float(data[-1].get("fundingRate", 0))
-    return None
+    """Returns funding rate decimal. Currently returns neutral 0.0 (Binance geo-blocked)."""
+    return 0.0
 
 
 # ── Coinglass liquidation levels ──────────────────────────────────────────────

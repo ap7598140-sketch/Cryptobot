@@ -182,8 +182,17 @@ class AlpacaClient:
             )
             bars = self.data.get_crypto_bars(req)
             result: dict[str, list[dict]] = {}
+            # alpaca-py returns a BarSet (dict-like) keyed by symbol;
+            # access via .data attribute or direct subscript, not .get()
+            bars_data = bars.data if hasattr(bars, "data") else bars
             for sym in symbols:
-                sym_bars = bars.get(sym, [])
+                sym_bars = bars_data.get(sym, []) if hasattr(bars_data, "get") else []
+                if not sym_bars:
+                    # fallback: try direct attribute access by symbol
+                    try:
+                        sym_bars = bars[sym]
+                    except (KeyError, TypeError):
+                        sym_bars = []
                 result[sym] = [
                     {
                         "t": b.timestamp.isoformat(),

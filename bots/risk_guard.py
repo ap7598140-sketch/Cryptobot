@@ -199,7 +199,9 @@ class RiskGuard:
         """
         try:
             alpaca_pos = await asyncio.to_thread(self.alpaca.get_all_positions)
-            alpaca_symbols = {p["symbol"] for p in alpaca_pos}
+            # Only reconcile crypto positions (symbols containing '/').
+            # Ignore stocks (SPY, NVDA, QQQ, etc.) that may exist in the account.
+            alpaca_symbols = {p["symbol"] for p in alpaca_pos if "/" in p["symbol"]}
             state_symbols  = set(state.open_positions.keys())
 
             # Coins in state but not on Alpaca (missing fills / errors)
