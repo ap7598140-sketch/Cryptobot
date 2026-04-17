@@ -1,8 +1,6 @@
 """
 Telegram notifications + /stop command listener.
-All sends are fire-and-forget; the /stop handler sets state.stop_command.
 """
-import asyncio
 import logging
 from typing import Optional
 
@@ -17,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class TelegramNotifier:
     def __init__(self, token: str, chat_id: str):
-        self.token = token
+        self.token   = token
         self.chat_id = chat_id
         self._bot: Optional[Bot] = None
         self._app: Optional[Application] = None
@@ -30,7 +28,7 @@ class TelegramNotifier:
         await self._app.start()
         if self._app.updater:
             await self._app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Telegram bot initialized and polling for commands")
+        logger.info("Telegram bot online")
 
     async def shutdown(self):
         if self._app:
@@ -41,101 +39,63 @@ class TelegramNotifier:
 
     async def _handle_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.stop_command = True
-        await update.message.reply_text("STOP command received — halting all bots.")
-        logger.warning("STOP command received via Telegram")
+        await update.message.reply_text("STOP received -- halting all bots.")
+        logger.warning("/stop command received")
 
     async def send(self, message: str):
         if not self._bot:
-            logger.warning("Telegram not initialised — skipping message")
             return
         try:
             await self._bot.send_message(chat_id=self.chat_id, text=message)
         except TelegramError as e:
             logger.error("Telegram send error: %s", e)
 
-    # ── typed notification helpers ────────────────────────────────────────────
-
-    async def trade_opened(self, coin: str, direction: str, price: float,
-                           qty: float, score: int, size_usd: float):
+    async def trade_opened(self, coin: str, direction: str, strategy: str,
+                           price: float, qty: float, score: int, usd: float):
         await self.send(
             f"TRADE OPENED\n"
-            f"  {coin} {direction.upper()}\n"
-            f"  Entry: ${price:,.2f}  Qty: {qty:.4f}  (${size_usd:,.2f})\n"
-            f"  Confidence: {score}/100"
+            f"  {coin} {direction.upper()} [{strategy}]\n"
+            f"  Entry: ${price:,.2f}  Qty: {qty:.4f}  (${usd:,.2f})\n"
+            f"  Score: {score}/100"
         )
 
     async def take_profit(self, coin: str, gain_pct: float, gain_usd: float):
-        await self.send(
-            f"TAKE PROFIT HIT\n"
-            f"  {coin}\n"
-            f"  Gain: +{gain_pct:.2f}%  (+${gain_usd:,.2f})"
-        )
+        await self.send(f"TAKE PROFIT\n  {coin}\n  +{gain_pct:.2f}%  (+${gain_usd:,.2f})")
 
     async def stop_loss_fired(self, coin: str, loss_pct: float, loss_usd: float):
-        await self.send(
-            f"STOP LOSS FIRED\n"
-            f"  {coin}\n"
-            f"  Loss: -{loss_pct:.2f}%  (-${loss_usd:,.2f})"
-        )
+        await self.send(f"STOP LOSS\n  {coin}\n  -{loss_pct:.2f}%  (-${loss_usd:,.2f})")
 
-    async def trailing_stop_triggered(self, coin: str, locked_profit_pct: float):
-        await self.send(
-            f"TRAILING STOP TRIGGERED\n"
-            f"  {coin}\n"
-            f"  Locked-in profit: +{locked_profit_pct:.2f}%"
-        )
+    async def trailing_stop_triggered(self, coin: str, profit_pct: float):
+        await self.send(f"TRAILING STOP\n  {coin}\n  Locked: +{profit_pct:.2f}%")
 
-    async def partial_exit(self, coin: str, sold_qty: float, remaining_qty: float,
+    async def partial_exit(self, coin: str, sold_qty: float, remaining: float,
                            price: float, gain_pct: float):
         await self.send(
-            f"PARTIAL EXIT\n"
-            f"  {coin}\n"
+            f"PARTIAL EXIT\n  {coin}\n"
             f"  Sold {sold_qty:.4f} @ ${price:,.2f}  (+{gain_pct:.2f}%)\n"
-            f"  Remaining: {remaining_qty:.4f}"
+            f"  Remaining: {remaining:.4f}"
         )
 
     async def daily_loss_limit(self, loss_pct: float):
-        await self.send(
-            f"DAILY LOSS LIMIT REACHED\n"
-            f"  Loss today: {loss_pct:.2f}%\n"
-            f"  All trading paused until midnight UTC"
-        )
+        await self.send(f"DAILY LOSS LIMIT\n  -{loss_pct:.2f}% -- paused until midnight UTC")
 
-    async def drawdown_circuit_breaker(self, drawdown_pct: float):
-        await self.send(
-            f"DRAWDOWN CIRCUIT BREAKER TRIGGERED\n"
-            f"  Portfolio down {drawdown_pct:.2f}% from peak\n"
-            f"  System fully paused — manual review required"
-        )
+    async def drawdown_circuit_breaker(self, dd_pct: float):
+        await self.send(f"DRAWDOWN CIRCUIT BREAKER\n  -{dd_pct:.2f}% from peak -- fully paused")
 
     async def consecutive_loss_pause(self, resume_time: str):
-        await self.send(
-            f"2 CONSECUTIVE LOSSES — PAUSING\n"
-            f"  Resuming at {resume_time} UTC"
-        )
+        await self.send(f"CONSECUTIVE LOSS PAUSE\n  Resuming at {resume_time} UTC")
 
     async def reconciliation_mismatch(self, details: str):
-        await self.send(
-            f"POSITION RECONCILIATION MISMATCH\n"
-            f"  {details}\n"
-            f"  Trading paused — manual review required"
-        )
+        await self.send(f"RECONCILIATION MISMATCH\n  {details}\n  Trading paused")
 
     async def strategy_decay_warning(self, win_rate: float, action: str):
-        await self.send(
-            f"STRATEGY DECAY WARNING\n"
-            f"  Win rate (last 20): {win_rate:.1f}%\n"
-            f"  Action: {action}"
-        )
+        await self.send(f"STRATEGY DECAY\n  Win rate: {win_rate:.1f}%\n  {action}")
 
     async def volatility_spike_block(self, coin: str):
-        await self.send(
-            f"VOLATILITY SPIKE BLOCK\n"
-            f"  {coin} ATR spiked — new entries paused"
-        )
+        await self.send(f"VOLATILITY SPIKE\n  {coin} -- new entries paused")
 
-    async def morning_briefing(self, briefing: str):
-        await self.send(f"MORNING BRIEFING\n\n{briefing}")
+    async def morning_briefing(self, text: str):
+        await self.send(f"MORNING BRIEFING\n\n{text}")
 
     async def system_stopped(self):
-        await self.send("SYSTEM STOPPED\n  All bots halted via /stop command")
+        await self.send("SYSTEM STOPPED -- all bots halted")
