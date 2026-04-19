@@ -1,246 +1,184 @@
 """
-Bot 4 — Position Manager (Haiku)
-Runs every 30 s, monitors all open positions.
-
-Hard stop-loss at 3 % — NO AI, immediate execution.
-Tiered trailing stop: 3 % profit → trail 2 %; 6 % profit → trail 4 %.
-Partial exit: sell 50 % at 4 % profit.
-Time-based stop: exit full position after 4 hours of no meaningful movement.
-Re-entry signal: if exited a winner and trend still strong, flags to scanner queue.
+Bot 4 -- Position Manager (Haiku).
+Checks every 30s: hard stop, take profit, trailing stop, time limit.
+Grid strategy: take profit at resistance.
+Trending strategy: tiered trailing stops.
 """
 import asyncio
-import json
 import logging
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from core.alpaca_client import AlpacaClient
+from core.claude_client import ClaudeClient
 from core.state import state
 from core.telegram_notifier import TelegramNotifier
 from settings import (
-    HARD_STOP_PCT, PARTIAL_EXIT_PCT, TAKE_PROFIT_PCT,
+    HARD_STOP_PCT, TAKE_PROFIT_PCT, PARTIAL_EXIT_PCT,
     TRAILING_TIER1_PROFIT, TRAILING_TIER1_TRAIL,
     TRAILING_TIER2_PROFIT, TRAILING_TIER2_TRAIL,
-    POSITION_MGR_INTERVAL_S, POSITION_TIME_LIMIT_HRS,
-    LOGS_DIR,
+    POSITION_TIME_LIMIT_HRS, POSITION_MGR_INTERVAL_S,
 )
 
 logger = logging.getLogger(__name__)
 
 
+def _exit_prompt(pos, current_price: float, regime: dict) -> str:
+    elapsed_hrs = (
+        (datetime.now(timezone.utc) -
+         datetime.fromisoformat(pos.opened_at)).total_seconds() / 3600
+    )
+    pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
+    if pos.direction == "short":
+        pnl_pct = -pnl_pct
+    return (
+        f"Manage position: {pos.coin} {pos.direction.upper()} [{pos.strategy}]\n"
+        f"entry={pos.entry_price:.2f} current={current_price:.2f} "
+        f"stop={pos.stop_price:.2f} target={pos.target_price:.2f}\n"
+        f"pnl={pnl_pct:.2f}% elapsed_hrs={elapsed_hrs:.1f}\n"
+        f"regime={regime.get('regime','unknown')} green_light={regime.get('green_light','yellow')}\n"
+        f"Action options: hold/exit/adjust_stop\n"
+        f"Return: {{\"action\":\"hold/exit/adjust_stop\",\"new_stop\":0.0,\"reason\":\"brief\"}}"
+    )
+
+
 class PositionManager:
-    def __init__(self, alpaca: AlpacaClient, telegram: TelegramNotifier,
-                 signal_queue: asyncio.Queue):
-        self.alpaca       = alpaca
-        self.telegram     = telegram
-        self.signal_queue = signal_queue   # for re-entry flagging
+    def __init__(self, claude: ClaudeClient, alpaca: AlpacaClient,
+                 telegram: TelegramNotifier):
+        self.claude   = claude
+        self.alpaca   = alpaca
+        self.telegram = telegram
 
     async def run(self):
-        logger.info("Position Manager started — interval %ds", POSITION_MGR_INTERVAL_S)
+        logger.info("Position Manager started -- interval %ds", POSITION_MGR_INTERVAL_S)
         while not state.stop_command:
             try:
-                await self._check_positions()
-            except Exception as exc:
-                logger.error("Position manager error: %s", exc)
+                await self._manage_all()
+            except Exception as e:
+                logger.error("Position Manager error: %s", e)
             await asyncio.sleep(POSITION_MGR_INTERVAL_S)
 
-    async def _check_positions(self):
-        coins = list(state.open_positions.keys())
-        if not coins:
+    async def _manage_all(self):
+        if await state.is_halted():
+            return
+        for coin, pos in list(state.open_positions.items()):
+            try:
+                await self._manage_one(coin, pos)
+            except Exception as e:
+                logger.error("Error managing %s: %s", coin, e)
+
+    async def _manage_one(self, coin: str, pos):
+        price_data = await asyncio.to_thread(self.alpaca.get_latest_price, coin)
+        if not price_data:
+            return
+        current = float(price_data)
+
+        if pos.direction == "long" and current > pos.peak_price:
+            pos.peak_price = current
+            await state.update_position(coin, pos)
+        elif pos.direction == "short" and current < pos.peak_price:
+            pos.peak_price = current
+            await state.update_position(coin, pos)
+
+        pnl_pct = (current - pos.entry_price) / pos.entry_price
+        if pos.direction == "short":
+            pnl_pct = -pnl_pct
+
+        if pos.direction == "long" and current <= pos.stop_price:
+            await self._close(coin, pos, current, "hard_stop")
+            return
+        if pos.direction == "short" and current >= pos.stop_price:
+            await self._close(coin, pos, current, "hard_stop")
             return
 
-        # Get current prices from Alpaca in one call
-        alpaca_positions = await asyncio.to_thread(self.alpaca.get_all_positions)
-        price_map = {p["symbol"]: p["current_price"] for p in alpaca_positions}
-
-        for coin in coins:
-            pos = state.open_positions.get(coin)
-            if not pos or pos.filled_qty <= 0:
-                continue
-
-            current_price = price_map.get(coin)
-            if not current_price:
-                continue
-
-            await self._manage_position(pos, current_price)
-
-    async def _manage_position(self, pos, current_price: float):
-        coin      = pos.coin
-        direction = pos.direction
-        entry     = pos.entry_price
-
-        if direction == "long":
-            pnl_pct = (current_price - entry) / entry
-        else:
-            pnl_pct = (entry - current_price) / entry
-
-        # ── 1. HARD STOP — no AI, no override ────────────────────────────────
-        if pnl_pct <= -HARD_STOP_PCT:
-            logger.warning("HARD STOP triggered for %s at %.2f (%.2f%%)",
-                           coin, current_price, pnl_pct * 100)
-            await self._close_position(pos, current_price, "hard_stop")
-            loss_usd = abs(pnl_pct) * pos.filled_qty * entry
-            await self.telegram.stop_loss_fired(coin, abs(pnl_pct) * 100, loss_usd)
+        elapsed_hrs = (
+            datetime.now(timezone.utc) -
+            datetime.fromisoformat(pos.opened_at)
+        ).total_seconds() / 3600
+        if elapsed_hrs >= POSITION_TIME_LIMIT_HRS:
+            await self._close(coin, pos, current, "time_limit")
             return
 
-        # ── 2. Update trailing stop level ────────────────────────────────────
-        pos.max_profit_pct = max(pos.max_profit_pct, pnl_pct)
-
-        if pos.max_profit_pct >= TRAILING_TIER2_PROFIT:
-            trail_pct = TRAILING_TIER2_TRAIL
-        elif pos.max_profit_pct >= TRAILING_TIER1_PROFIT:
-            trail_pct = TRAILING_TIER1_TRAIL
-        else:
-            trail_pct = None
-
-        if trail_pct is not None:
-            if direction == "long":
-                new_trail_stop = current_price * (1 - trail_pct)
-                if pos.trailing_stop_price is None or new_trail_stop > pos.trailing_stop_price:
-                    pos.trailing_stop_price = new_trail_stop
-            else:
-                new_trail_stop = current_price * (1 + trail_pct)
-                if pos.trailing_stop_price is None or new_trail_stop < pos.trailing_stop_price:
-                    pos.trailing_stop_price = new_trail_stop
-
-        # ── 3. Check trailing stop breach ─────────────────────────────────────
-        if pos.trailing_stop_price is not None:
-            hit = (direction == "long" and current_price <= pos.trailing_stop_price) or \
-                  (direction == "short" and current_price >= pos.trailing_stop_price)
-            if hit:
-                logger.info("Trailing stop hit for %s @ %.2f", coin, current_price)
-                await self._close_position(pos, current_price, "trailing_stop")
-                await self.telegram.trailing_stop_triggered(coin, pos.max_profit_pct * 100)
+        if pos.strategy == "grid":
+            if pos.direction == "long" and current >= pos.target_price:
+                await self._close(coin, pos, current, "grid_take_profit")
+                return
+            if pos.direction == "short" and current <= pos.target_price:
+                await self._close(coin, pos, current, "grid_take_profit")
                 return
 
-        # ── 4. Partial exit at 4 % ────────────────────────────────────────────
-        if not pos.partial_exit_done and pnl_pct >= PARTIAL_EXIT_PCT:
-            half_qty = round(pos.filled_qty * 0.50, 6)
-            if half_qty > 0:
-                side = "sell" if direction == "long" else "buy"
-                order_id = await asyncio.to_thread(
-                    self.alpaca.place_limit_order, coin, side, half_qty, current_price
+        if pos.strategy != "grid":
+            peak_pnl = abs(pos.peak_price - pos.entry_price) / pos.entry_price
+
+            if peak_pnl >= TRAILING_TIER2_PROFIT:
+                trail_price = (
+                    pos.peak_price * (1 - TRAILING_TIER2_TRAIL)
+                    if pos.direction == "long"
+                    else pos.peak_price * (1 + TRAILING_TIER2_TRAIL)
                 )
-                if order_id:
-                    pos.partial_exit_done = True
-                    pos.filled_qty        = round(pos.filled_qty - half_qty, 6)
-                    gain_pct              = pnl_pct * 100
-                    await self.telegram.partial_exit(
-                        coin, half_qty, pos.filled_qty, current_price, gain_pct
-                    )
-                    logger.info("Partial exit: %s sold %.6f @ %.2f", coin, half_qty, current_price)
-                    _log_event(coin, "partial_exit", current_price, pnl_pct)
+                hit = (pos.direction == "long" and current <= trail_price) or \
+                      (pos.direction == "short" and current >= trail_price)
+                if hit:
+                    await self._close(coin, pos, current, "trailing_tier2")
+                    await self.telegram.trailing_stop_triggered(coin, pnl_pct * 100)
+                    return
+
+            elif peak_pnl >= TRAILING_TIER1_PROFIT:
+                trail_price = (
+                    pos.peak_price * (1 - TRAILING_TIER1_TRAIL)
+                    if pos.direction == "long"
+                    else pos.peak_price * (1 + TRAILING_TIER1_TRAIL)
+                )
+                hit = (pos.direction == "long" and current <= trail_price) or \
+                      (pos.direction == "short" and current >= trail_price)
+                if hit:
+                    await self._close(coin, pos, current, "trailing_tier1")
+                    await self.telegram.trailing_stop_triggered(coin, pnl_pct * 100)
+                    return
+
+            if pnl_pct >= PARTIAL_EXIT_PCT and not pos.partial_taken:
+                partial_qty = round(pos.qty * 0.5, 4)
+                await asyncio.to_thread(self.alpaca.place_market_order,
+                                         coin, partial_qty,
+                                         "sell" if pos.direction == "long" else "buy")
+                pos.partial_taken = True
+                pos.qty -= partial_qty
+                await state.update_position(coin, pos)
+                await self.telegram.partial_exit(
+                    coin, partial_qty, pos.qty, current, pnl_pct * 100)
+                return
+
+        from core.regime_cache import get_regime
+        regime = get_regime()
+        h_result = await self.claude.haiku(_exit_prompt(pos, current, regime),
+                                           bot="position_mgr")
+        if not h_result or not isinstance(h_result, dict):
+            logger.warning("Position Haiku failed for %s -- holding", coin)
             return
 
-        # ── 5. Full take-profit ───────────────────────────────────────────────
-        if pnl_pct >= TAKE_PROFIT_PCT:
-            logger.info("Take profit hit for %s @ %.2f (%.2f%%)",
-                        coin, current_price, pnl_pct * 100)
-            await self._close_position(pos, current_price, "take_profit")
-            gain_usd = pnl_pct * pos.filled_qty * entry
-            await self.telegram.take_profit(coin, pnl_pct * 100, gain_usd)
-            # Check re-entry potential
-            await self._check_reentry(pos, current_price, pnl_pct)
-            return
+        action = h_result.get("action", "hold")
+        if action == "exit":
+            await self._close(coin, pos, current, f"ai_exit: {h_result.get('reason','')}")
+        elif action == "adjust_stop":
+            new_stop = float(h_result.get("new_stop", pos.stop_price))
+            if new_stop > 0:
+                pos.stop_price = new_stop
+                await state.update_position(coin, pos)
+                logger.info("Adjusted stop for %s to %.2f", coin, new_stop)
 
-        # ── 6. Time-based stop: 4 hours no meaningful move ───────────────────
-        age_hours = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 3600
-        if age_hours >= POSITION_TIME_LIMIT_HRS and abs(pnl_pct) < 0.01:
-            logger.info("Time-based stop for %s — %dh no movement", coin, POSITION_TIME_LIMIT_HRS)
-            await self._close_position(pos, current_price, "time_stop")
-            pnl_usd = pnl_pct * pos.filled_qty * entry
-            if pnl_pct >= 0:
-                await self.telegram.take_profit(coin, pnl_pct * 100, pnl_usd)
-            else:
-                await self.telegram.stop_loss_fired(coin, abs(pnl_pct) * 100, abs(pnl_usd))
-
-    async def _close_position(self, pos, current_price: float, reason: str):
-        """Close entire position — market order through Alpaca."""
-        coin      = pos.coin
-        direction = pos.direction
-        entry     = pos.entry_price
-        filled    = pos.filled_qty
-
-        pnl_pct = ((current_price - entry) / entry) if direction == "long" \
-                  else ((entry - current_price) / entry)
-        pnl_usd = pnl_pct * filled * entry
-
+    async def _close(self, coin: str, pos, current: float, reason: str):
         await asyncio.to_thread(self.alpaca.close_position, coin)
-        await state.remove_position(coin)
-        await state.record_pnl(pnl_usd)
+        pnl_pct = (current - pos.entry_price) / pos.entry_price * 100
+        if pos.direction == "short":
+            pnl_pct = -pnl_pct
+        pnl_usd = pnl_pct / 100 * pos.usd_value
 
-        _log_event(coin, reason, current_price, pnl_pct, pnl_usd)
-        _append_trade_record(pos, current_price, pnl_pct, pnl_usd, reason)
-        logger.info("Position closed: %s reason=%s pnl=%.2f%%", coin, reason, pnl_pct * 100)
+        win = pnl_pct > 0
+        await state.remove_position(coin, win=win, pnl_pct=pnl_pct, pnl_usd=pnl_usd)
+        await state.record_daily_pnl(pnl_usd)
 
-    async def _check_reentry(self, pos, current_price: float, pnl_pct: float):
-        """If we just exited a winning trade and trend still looks strong, re-flag."""
-        if pnl_pct < 0.03:   # only re-entry flag if meaningful win
-            return
-        # We create a minimal re-entry signal for the scanner queue
-        reentry = {
-            "coin": pos.coin,
-            "direction": pos.direction,
-            "score": max(70, pos.score - 5),  # slightly lower confidence
-            "reason": f"re-entry after profitable exit (pnl={pnl_pct:.2f}%)",
-            "price": current_price,
-            "ind_15m": {}, "ind_1h": {}, "asian_range": {},
-            "funding_rate": 0, "fear_greed": {}, "btc_dom_trend": "stable",
-            "stablecoin_flow": "neutral",
-            "scanned_at": datetime.now(timezone.utc).isoformat(),
-            "is_reentry": True,
-        }
-        try:
-            self.signal_queue.put_nowait(reentry)
-            logger.info("Re-entry signal queued for %s", pos.coin)
-        except asyncio.QueueFull:
-            pass
+        if "stop" in reason:
+            await self.telegram.stop_loss_fired(coin, abs(pnl_pct), abs(pnl_usd))
+        elif "profit" in reason or "take_profit" in reason:
+            await self.telegram.take_profit(coin, pnl_pct, pnl_usd)
 
-
-def _log_event(coin: str, event: str, price: float, pnl_pct: float, pnl_usd: float = 0):
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    path = os.path.join(LOGS_DIR, f"position_{coin.replace('/','_')}_{event}_{ts}.json")
-    try:
-        with open(path, "w") as f:
-            json.dump({
-                "coin": coin, "event": event, "price": price,
-                "pnl_pct": pnl_pct, "pnl_usd": pnl_usd,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }, f, indent=2)
-    except Exception as e:
-        logger.error("Failed to write position log: %s", e)
-
-
-def _append_trade_record(pos, exit_price: float, pnl_pct: float, pnl_usd: float, reason: str):
-    """Append closed trade to data/trades.json for performance tracker."""
-    import json, os
-    path = "data/trades.json"
-    os.makedirs("data", exist_ok=True)
-    records = []
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                records = json.load(f)
-        except Exception:
-            records = []
-    records.append({
-        "coin":        pos.coin,
-        "direction":   pos.direction,
-        "entry_price": pos.entry_price,
-        "exit_price":  exit_price,
-        "qty":         pos.filled_qty,
-        "pnl_pct":     pnl_pct,
-        "pnl_usd":     pnl_usd,
-        "score":       pos.score,
-        "reason":      reason,
-        "opened_at":   pos.opened_at.isoformat(),
-        "closed_at":   datetime.now(timezone.utc).isoformat(),
-        "win":         pnl_usd > 0,
-        "hour_utc":    datetime.now(timezone.utc).hour,
-    })
-    try:
-        with open(path, "w") as f:
-            json.dump(records, f, indent=2, default=str)
-    except Exception as e:
-        logger.error("Failed to append trade record: %s", e)
+        logger.info("Closed %s: reason=%s pnl=%.2f%%", coin, reason, pnl_pct)
