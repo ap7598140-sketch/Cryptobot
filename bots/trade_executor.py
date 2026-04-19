@@ -1,296 +1,155 @@
 """
-Bot 3 — Trade Executor (Sonnet)
-Triggers on confirmed signals from Trend Analyzer.
-  - Enforces 2:1 reward-to-risk
-  - Avoids round numbers
-  - Limit orders only
-  - Scaled entry: 50 % first → 50 % confirm if filled within 5 min
-  - Cancels unfilled orders after 5 min
-  - Must have Risk Guard green before every order
+Bot 3 -- Trade Executor (Sonnet).
+Receives confirmed signals from Trend Analyzer, sizes and places orders,
+then hands position off to Position Manager via state.
 """
 import asyncio
-import json
 import logging
-import math
-import os
 from datetime import datetime, timezone
 
 from core.alpaca_client import AlpacaClient
 from core.claude_client import ClaudeClient
-from core.state import TradingState, Position, state
+from core.regime_cache import get_params
+from core.state import state, Position
 from core.telegram_notifier import TelegramNotifier
 from settings import (
-    CASH_RESERVE_PCT, MAX_POSITIONS, MAX_RISK_PER_TRADE,
-    HARD_STOP_PCT, TAKE_PROFIT_PCT, PARTIAL_EXIT_PCT,
-    ENTRY_FIRST_FRAC, ENTRY_CONFIRM_FRAC, ORDER_TIMEOUT_S,
-    ROUND_NUM_OFFSET_PCT, MIN_REWARD_RISK, LOGS_DIR,
-    MAX_TOKENS_EXECUTOR,
+    PORTFOLIO_VALUE, CASH_RESERVE_PCT, MAX_POSITIONS, MAX_RISK_PER_TRADE,
+    MIN_REWARD_RISK, ENTRY_FIRST_FRAC, ENTRY_CONFIRM_FRAC, ORDER_TIMEOUT_S,
+    ROUND_NUM_OFFSET_PCT, DRAWDOWN_SIZE_THRESHOLD, DRAWDOWN_SIZE_REDUCTION,
+    DECAY_LOOKBACK, DECAY_WIN_RATE_FLOOR, DECAY_SIZE_REDUCTION,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _avoid_round_number(price: float, direction: str) -> float:
-    """
-    Shift entry/stop slightly away from round numbers to avoid stop-hunting.
-    For long entries: enter slightly above the round number.
-    For short entries: enter slightly below.
-    """
-    magnitude = 10 ** math.floor(math.log10(max(price, 1)))
-    remainder = price % magnitude
-    is_round  = remainder < magnitude * 0.005 or remainder > magnitude * 0.995
-    if not is_round:
-        return round(price, 2)
-    offset = price * ROUND_NUM_OFFSET_PCT
-    if direction == "long":
-        return round(price + offset, 2)
-    return round(price - offset, 2)
-
-
-def _calc_position_size(portfolio_value: float, entry_price: float,
-                         stop_price: float, size_multiplier: float,
-                         cash_available: float, n_open: int) -> float:
-    """
-    Risk-based position sizing:
-      max_risk_$ = portfolio_value * MAX_RISK_PER_TRADE
-      qty = max_risk_$ / |entry - stop| per unit
-    Also bounded by:
-      - 40 % cash reserve
-      - max 30 % portfolio per position (to stay within 2-position limit)
-    """
-    risk_per_trade_usd = portfolio_value * MAX_RISK_PER_TRADE * size_multiplier
-    price_risk = abs(entry_price - stop_price)
-    if price_risk <= 0:
-        return 0.0
-
-    qty_by_risk = risk_per_trade_usd / price_risk
-
-    # Max notional we can use
-    reserve       = portfolio_value * CASH_RESERVE_PCT
-    deployable    = max(cash_available - reserve, 0)
-    max_per_trade = portfolio_value * 0.30   # 30 % per position
-    max_notional  = min(deployable, max_per_trade)
-
-    qty_by_capital = max_notional / entry_price
-    qty = min(qty_by_risk, qty_by_capital)
-    return round(qty, 6)
-
-
-def _executor_prompt(sig: dict, portfolio_value: float, cash: float) -> str:
-    rr = (sig['target'] - sig['entry']) / (sig['entry'] - sig['stop']) \
-        if sig['entry'] != sig['stop'] else 0
+def _size_prompt(sig: dict, account_cash: float, params: dict) -> str:
     return (
-        f"Validate & finalise trade parameters. {sig['coin']} {sig['direction'].upper()}\n"
-        f"score={sig['final_score']} entry={sig['entry']:.2f} "
-        f"stop={sig['stop']:.2f} target={sig['target']:.2f} "
-        f"rr_ratio={rr:.2f} portfolio={portfolio_value:.2f} cash={cash:.2f}\n"
-        f"Rules: min_rr={MIN_REWARD_RISK} max_risk={MAX_RISK_PER_TRADE*100:.1f}% "
-        f"stop_pct={HARD_STOP_PCT*100:.0f}% target_pct={TAKE_PROFIT_PCT*100:.0f}%\n"
-        f"Return: {{\"approved\":true,\"entry\":{sig['entry']:.2f},"
-        f"\"stop\":{sig['stop']:.2f},\"target\":{sig['target']:.2f},"
-        f"\"reason\":\"brief\"}}"
+        f"Size trade for {sig['coin']} {sig['direction'].upper()} "
+        f"strategy={sig.get('strategy','momentum')} "
+        f"score={sig.get('final_score',0)}\n"
+        f"entry={sig['entry']:.2f} stop={sig['stop']:.2f} "
+        f"target={sig['target']:.2f}\n"
+        f"account_cash={account_cash:.2f} max_risk_pct={MAX_RISK_PER_TRADE}\n"
+        f"Calc position_size_usd, qty (to 4dp), risk/reward ratio.\n"
+        f"Return: {{\"qty\":0.0,\"usd\":0.0,\"rr_ratio\":0.0,\"approved\":true/false,\"reason\":\"brief\"}}"
     )
 
 
 class TradeExecutor:
     def __init__(self, claude: ClaudeClient, alpaca: AlpacaClient,
                  executor_queue: asyncio.Queue, telegram: TelegramNotifier):
-        self.claude   = claude
-        self.alpaca   = alpaca
-        self.queue    = executor_queue
-        self.telegram = telegram
+        self.claude         = claude
+        self.alpaca         = alpaca
+        self.executor_queue = executor_queue
+        self.telegram       = telegram
 
     async def run(self):
         logger.info("Trade Executor started")
         while not state.stop_command:
             try:
-                sig = await asyncio.wait_for(self.queue.get(), timeout=5.0)
+                sig = await asyncio.wait_for(self.executor_queue.get(), timeout=5.0)
                 await self._execute(sig)
-                self.queue.task_done()
+                self.executor_queue.task_done()
             except asyncio.TimeoutError:
                 continue
-            except Exception as exc:
-                logger.error("Executor error: %s", exc)
+            except Exception as e:
+                logger.error("Executor error: %s", e)
 
     async def _execute(self, sig: dict):
-        coin      = sig["coin"]
-        direction = sig["direction"]
-
-        # ── Risk Guard check ──────────────────────────────────────────────────
-        if not state.risk_guard_green or await state.is_halted():
-            logger.info("Risk Guard red/paused — skipping %s", coin)
+        if await state.is_halted():
             return
 
-        # ── Max positions guard ───────────────────────────────────────────────
-        async with state._lock:
-            n_open = len(state.open_positions)
-            if n_open >= MAX_POSITIONS:
-                logger.info("Max positions reached — skipping %s", coin)
-                return
-            # Correlation block: never hold > 1 of BTC/ETH/SOL
-            crypto_coins = {"BTC/USD", "ETH/USD", "SOL/USD"}
-            if coin in crypto_coins and any(c in crypto_coins for c in state.open_positions):
-                logger.info("Correlation block — already in a major crypto — skipping %s", coin)
-                return
+        coin = sig["coin"]
 
-        # ── Enforce 2:1 R:R ───────────────────────────────────────────────────
-        entry  = float(sig["entry"])
-        stop   = float(sig["stop"])
-        target = float(sig["target"])
-        price_risk = abs(entry - stop)
-        price_rew  = abs(target - entry)
-        if price_risk == 0 or price_rew / price_risk < MIN_REWARD_RISK:
-            logger.info("R:R %.2f below min %.1f — cancelling %s",
-                        price_rew / max(price_risk, 0.001), MIN_REWARD_RISK, coin)
+        if len(state.open_positions) >= MAX_POSITIONS:
+            logger.info("Max positions reached -- skipping %s", coin)
             return
 
-        # ── Avoid round numbers ───────────────────────────────────────────────
-        entry  = _avoid_round_number(entry, direction)
-        stop   = _avoid_round_number(stop, "short" if direction == "long" else "long")
-        target = _avoid_round_number(target, direction)
-
-        # ── Get live account data ─────────────────────────────────────────────
-        portfolio_value = await asyncio.to_thread(self.alpaca.get_portfolio_value)
-        cash            = await asyncio.to_thread(self.alpaca.get_cash)
-        await state.update_portfolio_value(portfolio_value)
-
-        # ── Claude validation ─────────────────────────────────────────────────
-        prompt     = _executor_prompt({**sig, "entry": entry, "stop": stop, "target": target},
-                                      portfolio_value, cash)
-        validation = await self.claude.executor_call(prompt)
-
-        if not validation or not validation.get("approved"):
-            logger.info("Executor Claude rejected trade: %s reason=%s",
-                        coin, validation.get("reason") if validation else "no response")
+        if coin in state.open_positions:
+            logger.info("Already in position for %s -- skipping", coin)
             return
 
-        # Use Claude's potentially adjusted levels if provided
-        entry  = float(validation.get("entry", entry))
-        stop   = float(validation.get("stop", stop))
-        target = float(validation.get("target", target))
-
-        # ── Position sizing ───────────────────────────────────────────────────
-        async with state._lock:
-            n_open       = len(state.open_positions)
-            size_mult    = state.size_multiplier
-        total_qty    = _calc_position_size(portfolio_value, entry, stop,
-                                           size_mult, cash, n_open)
-        if total_qty <= 0:
-            logger.info("Position size zero — insufficient capital for %s", coin)
+        entry, stop, target = sig["entry"], sig["stop"], sig["target"]
+        risk   = abs(entry - stop)
+        reward = abs(target - entry)
+        rr     = reward / risk if risk > 0 else 0
+        if rr < MIN_REWARD_RISK:
+            logger.info("RR %.2f < %.2f for %s -- skipping", rr, MIN_REWARD_RISK, coin)
             return
 
-        first_qty = round(total_qty * ENTRY_FIRST_FRAC, 6)
-        if first_qty <= 0:
+        account    = await asyncio.to_thread(self.alpaca.get_account)
+        cash       = float(account.cash) if account else PORTFOLIO_VALUE * (1 - CASH_RESERVE_PCT)
+        deployable = cash - PORTFOLIO_VALUE * CASH_RESERVE_PCT
+        if deployable <= 0:
+            logger.info("Cash reserve hit -- skipping %s", coin)
             return
 
-        side = "buy" if direction == "long" else "sell"
-
-        # ── Re-check Risk Guard immediately before order ──────────────────────
-        if not state.risk_guard_green:
-            logger.info("Risk Guard went red before order — aborting %s", coin)
-            return
-
-        # ── Place first limit order (50 %) ────────────────────────────────────
-        order_id = await asyncio.to_thread(
-            self.alpaca.place_limit_order, coin, side, first_qty, entry
-        )
-        if not order_id:
-            logger.error("Failed to place first order for %s", coin)
-            return
-
-        # ── Register position in state ────────────────────────────────────────
-        now = datetime.now(timezone.utc)
-        position = Position(
-            coin=coin, direction=direction,
-            entry_price=entry, quantity=total_qty, filled_qty=0.0,
-            stop_price=stop, target_price=target,
-            score=sig["final_score"], opened_at=now,
-            pending_order_id=order_id,
-        )
-        await state.add_position(position)
-
-        notional = first_qty * entry
-        await self.telegram.trade_opened(coin, direction, entry, first_qty,
-                                         sig["final_score"], notional)
-        logger.info("First order placed: %s %s %.6f @ %.2f", coin, direction, first_qty, entry)
-
-        # ── Wait up to 5 min for fill, then place second half ─────────────────
-        asyncio.create_task(self._manage_scaled_entry(
-            coin, order_id, total_qty, entry, stop, target, direction
-        ))
-
-        _log_trade(sig, entry, stop, target, total_qty, order_id)
-
-    async def _manage_scaled_entry(self, coin: str, first_order_id: str,
-                                   total_qty: float, entry: float, stop: float,
-                                   target: float, direction: str):
-        """
-        Wait ORDER_TIMEOUT_S for first fill.
-        If filled, place second 50 % immediately.
-        If not filled, cancel and remove position.
-        """
-        await asyncio.sleep(ORDER_TIMEOUT_S)
-
-        status = await asyncio.to_thread(self.alpaca.get_order_status, first_order_id)
-        pos    = state.open_positions.get(coin)
-        if not pos:
-            return
-
-        if status not in ("filled", "partially_filled"):
-            # Cancel and clean up
-            await asyncio.to_thread(self.alpaca.cancel_order, first_order_id)
-            await state.remove_position(coin)
-            logger.info("First order unfilled after %ds — cancelled %s", ORDER_TIMEOUT_S, coin)
-            return
-
-        # Mark first fill
-        async with state._lock:
+        params   = get_params()
+        s_result = await self.claude.sonnet(_size_prompt(sig, deployable, params),
+                                            bot="executor_sonnet")
+        if not s_result or not isinstance(s_result, dict):
+            logger.warning("Executor Sonnet failed for %s -- closing any open position", coin)
             if coin in state.open_positions:
-                state.open_positions[coin].filled_qty = total_qty * ENTRY_FIRST_FRAC
-                state.open_positions[coin].pending_order_id = None
-
-        # Place second 50 %
-        second_qty = round(total_qty * ENTRY_CONFIRM_FRAC, 6)
-        if second_qty <= 0 or not state.risk_guard_green:
+                await asyncio.to_thread(self.alpaca.close_position, coin)
+                await state.remove_position(coin)
             return
 
-        side = "buy" if direction == "long" else "sell"
-        second_id = await asyncio.to_thread(
-            self.alpaca.place_limit_order, coin, side, second_qty, entry
+        if not s_result.get("approved", False):
+            logger.info("Sizing rejected for %s: %s", coin, s_result.get("reason"))
+            return
+
+        qty = float(s_result.get("qty", 0))
+        usd = float(s_result.get("usd", 0))
+        if qty <= 0 or usd <= 0:
+            logger.warning("Invalid qty/usd for %s", coin)
+            return
+
+        dd = await state.get_drawdown()
+        if dd >= DRAWDOWN_SIZE_THRESHOLD:
+            qty = round(qty * (1 - DRAWDOWN_SIZE_REDUCTION), 4)
+            usd = round(usd * (1 - DRAWDOWN_SIZE_REDUCTION), 2)
+            logger.info("Drawdown %.1f%% -> reduced size to %.4f", dd * 100, qty)
+
+        recent = state.recent_trades[-DECAY_LOOKBACK:] if state.recent_trades else []
+        if len(recent) >= DECAY_LOOKBACK:
+            wins = sum(1 for t in recent if t.get("win"))
+            if wins / len(recent) < DECAY_WIN_RATE_FLOOR:
+                qty = round(qty * (1 - DECAY_SIZE_REDUCTION), 4)
+                usd = round(usd * (1 - DECAY_SIZE_REDUCTION), 2)
+                logger.info("Strategy decay detected -> reduced size to %.4f", qty)
+
+        first_qty = round(qty * ENTRY_FIRST_FRAC, 4)
+        order = await asyncio.to_thread(self.alpaca.place_order,
+                                        coin, first_qty, sig["direction"])
+        if not order:
+            logger.error("Order failed for %s", coin)
+            return
+
+        await asyncio.sleep(2)
+        offset      = entry * ROUND_NUM_OFFSET_PCT
+        limit_price = round(entry - offset if sig["direction"] == "long" else entry + offset, 2)
+        second_qty  = round(qty * ENTRY_CONFIRM_FRAC, 4)
+        await asyncio.to_thread(self.alpaca.place_limit_order,
+                                 coin, second_qty, sig["direction"], limit_price)
+
+        pos = Position(
+            coin         = coin,
+            direction    = sig["direction"],
+            strategy     = sig.get("strategy", "momentum"),
+            entry_price  = entry,
+            stop_price   = stop,
+            target_price = target,
+            qty          = qty,
+            usd_value    = usd,
+            score        = sig.get("final_score", 0),
+            opened_at    = datetime.now(timezone.utc).isoformat(),
+            peak_price   = entry,
         )
-        if second_id:
-            async with state._lock:
-                if coin in state.open_positions:
-                    state.open_positions[coin].pending_order_id = second_id
-                    state.open_positions[coin].second_entry_placed = True
-            logger.info("Second order placed: %s %.6f @ %.2f", coin, second_qty, entry)
+        await state.add_position(coin, pos)
 
-            # Wait again for second fill
-            await asyncio.sleep(ORDER_TIMEOUT_S)
-            status2 = await asyncio.to_thread(self.alpaca.get_order_status, second_id)
-            if status2 not in ("filled", "partially_filled"):
-                await asyncio.to_thread(self.alpaca.cancel_order, second_id)
-                logger.info("Second order unfilled — cancelled for %s", coin)
-            else:
-                async with state._lock:
-                    if coin in state.open_positions:
-                        state.open_positions[coin].filled_qty = total_qty
-                        state.open_positions[coin].pending_order_id = None
-
-
-def _log_trade(sig: dict, entry: float, stop: float, target: float,
-               qty: float, order_id: str):
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    path = os.path.join(LOGS_DIR, f"trade_{sig['coin'].replace('/','_')}_{ts}.json")
-    record = {
-        "coin": sig["coin"], "direction": sig["direction"],
-        "entry": entry, "stop": stop, "target": target, "qty": qty,
-        "score": sig.get("final_score"), "order_id": order_id,
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        with open(path, "w") as f:
-            json.dump(record, f, indent=2)
-    except Exception as e:
-        logger.error("Failed to write trade log: %s", e)
+        await self.telegram.trade_opened(
+            coin, sig["direction"], sig.get("strategy", "momentum"),
+            entry, qty, sig.get("final_score", 0), usd,
+        )
+        logger.info("Executed: %s %s %.4f @ %.2f [%s]",
+                    coin, sig["direction"], qty, entry, sig.get("strategy"))
